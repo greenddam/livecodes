@@ -82,13 +82,37 @@ export const createAuthService = (isEmbed: boolean): AuthService => {
       }
       const provider = new GithubAuthProvider();
       scopes.forEach((scope) => provider.addScope(scope));
-      const result = await signInWithPopup(auth, provider);
-      const token = GithubAuthProvider.credentialFromResult(result)?.accessToken;
-      if (!token) return;
-      currentUser = result.user;
-      await saveToken(currentUser.uid, token);
-      await fetchUserName(currentUser);
-      return getUserInfo(result.user);
+
+      try {
+        console.log('--- Auth Debug: Initiating GitHub signInWithPopup...');
+        const result = await signInWithPopup(auth, provider);
+        console.log('--- Auth Debug: signInWithPopup successful. Checking for token...');
+
+        const token = GithubAuthProvider.credentialFromResult(result)?.accessToken;
+
+        if (!token) {
+          console.error('!!! Auth Error: FAILED to get access token from Firebase result.');
+          console.error('!!! Auth Error: This indicates an issue with the Firebase/GitHub configuration or the OAuth handshake.');
+          return;
+        }
+
+        console.log('--- Auth Debug: Access token received successfully (length:', token.length, ')');
+        
+        currentUser = result.user;
+        await saveToken(currentUser.uid, token);
+        
+        // This is the next point of failure to check
+        await fetchUserName(currentUser); 
+        
+        return getUserInfo(result.user);
+      } catch (error) {
+        console.error('!!! Auth Error: signInWithPopup failed.', error);
+        // Firebase Auth errors often have a 'code' and 'message' property
+        if ((error as any).code === 'auth/popup-closed-by-user') {
+          console.warn('User closed the login popup.');
+        }
+        return;
+      }
     },
     async signOut() {
       if (!auth) {
@@ -148,14 +172,44 @@ const fetchUserName = async (user: FirebaseUser) => {
     return fromUserInfo;
   }
 
-  const response = await fetch('https://api.github.com/user', {
-    headers: {
-      Accept: 'application/vnd.github.v3+json',
-      Authorization: 'token ' + (await getToken(uid)),
-    },
-  });
-  const userInfo = await response.json();
-  const login = userInfo.login;
-  saveUsername(uid, login);
-  return login;
+  const token = await getToken(uid);
+  if (!token) {
+    console.warn('!!! Sync Warning: Cannot fetch username. Token is missing.');
+    return '';
+  }
+
+  try {
+    console.log('--- Auth Debug: Attempting to fetch GitHub username with token...');
+    const response = await fetch('https://api.github.com/user', {
+      headers: {
+        Accept: 'application/vnd.github.v3+json',
+        Authorization: 'token ' + token, // Use the token received from Firebase
+      },
+    });
+
+    if (!response.ok) {
+      console.error(`!!! Sync Error: GitHub API call failed with status ${response.status} (${response.statusText})`);
+      const errorText = await response.text();
+      console.error('!!! Sync Error: Response body:', errorText.substring(0, 200) + '...'); // Log part of the error body
+      // A 401 error here means the token is invalid or scopes are incorrect/expired.
+      throw new Error(`GitHub user API failed: ${response.status}`);
+    }
+
+    const userInfo = await response.json();
+    const login = userInfo.login;
+    
+    if (!login) {
+        console.error('!!! Sync Error: GitHub API response was successful but did not contain a "login" field.', userInfo);
+        return '';
+    }
+
+    console.log('--- Auth Debug: GitHub username fetched successfully:', login);
+    saveUsername(uid, login);
+    return login;
+
+  } catch (error) {
+    console.error('!!! Sync Error: Failed to fetch GitHub user info.', error);
+    // If the error is network related, this catch block will execute.
+    return '';
+  }
 };
