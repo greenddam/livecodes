@@ -1,9 +1,14 @@
 /* eslint-disable @typescript-eslint/no-empty-function */
 import type { GithubScope, User } from '../models';
 import { decrypt, encrypt } from '../storage';
-import { getImportInstance } from '../utils';
 
-type FirebaseUser = import('firebase/auth').User;
+// --- CONFIGURATION CONSTANTS (MUST BE SET VIA ENVIRONMENT/BUILD PROCESS IN REAL APP) ---
+// Note: Client Secret is NOT required for the Device Flow exchange!
+const GITHUB_CLIENT_ID = 'YOUR_GITHUB_CLIENT_ID';
+const DEVICE_CODE_URL = 'https://github.com/login/device/code';
+const ACCESS_TOKEN_URL = 'https://github.com/login/oauth/access_token';
+// ---------------------------------------------------------------------------------------
+
 interface AuthService {
   load(): Promise<void>;
   getUser(): Promise<User | void>;
@@ -20,116 +25,208 @@ const fakeAuthService: AuthService = {
   isLoggedIn: () => false,
 };
 
+// Internal state to hold user data
+let currentUser: User | null = null;
+let isAuthenticated = false;
+
+// Function to handle the polling loop (must be defined outside the service for cleaner recursion)
+const pollForToken = (
+  deviceCode: string, 
+  interval: number, 
+  resolve: (user: User | void) => void, 
+  reject: (error: Error) => void,
+  startTime: number
+) => {
+  const timeout = setTimeout(async () => {
+    // Check for expiration (GitHub usually expires in 10 minutes)
+    if (Date.now() - startTime > 600000) { // 10 minutes (600,000 ms)
+        clearTimeout(timeout);
+        console.error('!!! Auth Error: Device code expired (10 minute limit reached). Please try signing in again.');
+        reject(new Error('Device code expired.'));
+        return;
+    }
+
+    try {
+      const response = await fetch(ACCESS_TOKEN_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({
+          client_id: GITHUB_CLIENT_ID,
+          device_code: deviceCode,
+          grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+        }),
+      });
+
+      const result = await response.json();
+
+      if (result.access_token) {
+        // SUCCESS! Authorization granted.
+        clearTimeout(timeout);
+        const token = result.access_token;
+        console.log('--- Auth Debug: Access token received successfully!');
+        
+        const tempUid = 'github-' + Math.random().toString(36).substring(2, 10); 
+        await saveToken(tempUid, token);
+
+        const userInfo = await fetchUserName(tempUid); 
+        
+        const user: User = {
+          uid: tempUid,
+          displayName: userInfo.displayName,
+          username: userInfo.username,
+          email: userInfo.email,
+          photoURL: userInfo.photoURL,
+          token: token,
+        };
+
+        currentUser = user;
+        isAuthenticated = true;
+        resolve(user);
+
+      } else if (result.error === 'authorization_pending') {
+        // User hasn't finished yet. Continue polling.
+        console.log('--- Auth Debug: Waiting for user authorization...');
+        pollForToken(deviceCode, interval, resolve, reject, startTime);
+
+      } else if (result.error === 'slow_down') {
+        // GitHub asked us to poll slower. Adjust interval.
+        const newInterval = interval + 5000; // Increase by 5 seconds
+        console.warn('--- Auth Warning: Slowing down polling interval to', newInterval, 'ms');
+        pollForToken(deviceCode, newInterval, resolve, reject, startTime);
+
+      } else if (result.error === 'access_denied') {
+        // User declined the authorization.
+        clearTimeout(timeout);
+        console.error('!!! Auth Error: Access denied by user.');
+        reject(new Error('Access denied by user.'));
+
+      } else if (result.error === 'expired_token') {
+        // Authorization window passed.
+        clearTimeout(timeout);
+        console.error('!!! Auth Error: Device code expired. Please try signing in again.');
+        reject(new Error('Device code expired.'));
+
+      } else {
+        // Any other error.
+        clearTimeout(timeout);
+        console.error('!!! Auth Error: Unknown polling error:', result.error_description || result.error);
+        reject(new Error(result.error_description || 'Unknown authentication error.'));
+      }
+    } catch (error) {
+      clearTimeout(timeout);
+      console.error('!!! Auth Error: Network failure during token polling.', error);
+      reject(error as Error);
+    }
+  }, interval * 1000); // interval is in seconds
+};
+
+
 export const createAuthService = (isEmbed: boolean): AuthService => {
-  // do not allow access to auth in embeds
   if (isEmbed) return fakeAuthService;
 
-  let initializeApp: typeof import('firebase/app').initializeApp;
-  let getApp: typeof import('firebase/app').getApp;
-  let getAuth: typeof import('firebase/auth').getAuth;
-  let signInWithPopup: typeof import('firebase/auth').signInWithPopup;
-  let signOut: typeof import('firebase/auth').signOut;
-  let GithubAuthProvider: typeof import('firebase/auth').GithubAuthProvider;
-  let firebaseConfig: import('firebase/app').FirebaseOptions;
-  let firebaseApp: import('firebase/app').FirebaseApp;
-  let auth: import('firebase/auth').Auth;
-  let currentUser: FirebaseUser | null;
-
-  return {
+  const authService: AuthService = {
     async load() {
-      const firebase = await getImportInstance('./{{hash:firebase.js}}');
-
-      initializeApp = firebase.initializeApp;
-      getApp = firebase.getApp;
-      getAuth = firebase.getAuth;
-      signInWithPopup = firebase.signInWithPopup;
-      signOut = firebase.signOut;
-      GithubAuthProvider = firebase.GithubAuthProvider;
-      firebaseConfig = firebase.firebaseConfig;
-
-      try {
-        firebaseApp = getApp();
-      } catch {
-        firebaseApp = initializeApp(firebaseConfig);
+      // Load existing user data if a token is present in localStorage
+      const existingUid = localStorage.getItem('current_uid');
+      if (existingUid) {
+        const token = await getToken(existingUid);
+        if (token) {
+          // Re-fetch user info using existing token
+          const userInfo = await fetchUserName(existingUid); 
+          
+          currentUser = {
+            uid: existingUid,
+            displayName: userInfo.displayName,
+            username: userInfo.username,
+            email: userInfo.email,
+            photoURL: userInfo.photoURL,
+            token: token,
+          } as User;
+          isAuthenticated = true;
+        }
       }
-      auth = getAuth(firebaseApp);
-      currentUser = auth.currentUser;
     },
     async getUser(): Promise<User | void> {
-      if (!auth) {
-        await this.load();
+      if (isAuthenticated && currentUser) {
+        return currentUser;
       }
-      const token = await getToken(currentUser?.uid);
-      if (currentUser) {
-        if (!token) return;
-        return Promise.resolve(await getUserInfo(currentUser));
-      }
-      return new Promise((resolve) => {
-        const unsubscribe = auth.onAuthStateChanged(async (user: FirebaseUser | null) => {
-          if (!user) {
-            resolve(undefined);
-          } else {
-            currentUser = user;
-            unsubscribe();
-            resolve(await getUserInfo(currentUser));
-          }
-        });
-      });
+      return undefined;
     },
     async signIn(scopes: GithubScope[] = ['gist', 'repo']): Promise<User | void> {
-      if (!auth) {
-        await this.load();
-      }
-      const provider = new GithubAuthProvider();
-      scopes.forEach((scope) => provider.addScope(scope));
-
       try {
-        console.log('--- Auth Debug: Initiating GitHub signInWithPopup...');
-        const result = await signInWithPopup(auth, provider);
-        console.log('--- Auth Debug: signInWithPopup successful. Checking for token...');
+        console.log('--- Auth Debug: Requesting Device Code from GitHub...');
+        
+        // 1. Request the device and user codes
+        const scopeString = scopes.join(' ');
+        const response = await fetch(DEVICE_CODE_URL, {
+          method: 'POST',
+          headers: { 
+            'Content-Type': 'application/json',
+            'Accept': 'application/json' // Request JSON response
+          },
+          body: JSON.stringify({
+            client_id: GITHUB_CLIENT_ID,
+            scope: scopeString
+          })
+        });
 
-        const token = GithubAuthProvider.credentialFromResult(result)?.accessToken;
-
-        if (!token) {
-          console.error('!!! Auth Error: FAILED to get access token from Firebase result.');
-          console.error('!!! Auth Error: This indicates an issue with the Firebase/GitHub configuration or the OAuth handshake.');
-          return;
+        if (!response.ok) {
+           const errorBody = await response.json();
+           throw new Error(`Device code request failed: ${response.status} - ${errorBody.error}`);
         }
 
-        console.log('--- Auth Debug: Access token received successfully (length:', token.length, ')');
+        const result = await response.json();
+
+        const { 
+          device_code, 
+          user_code, 
+          verification_uri, 
+          interval 
+        } = result;
+
+        if (!device_code || !user_code || !verification_uri) {
+            throw new Error('Missing required codes from GitHub response.');
+        }
+
+        // 2. Instruct the user (using console since we can't show a custom modal)
+        console.log(
+          '========================================================================================\n',
+          '| 🐙 GITHUB SIGN IN REQUIRED |\n',
+          '| 1. Open this URL in a new tab: ', verification_uri, '\n',
+          '| 2. Enter the following code when prompted: ', user_code, '\n',
+          '| 3. Click "Authorize" on the GitHub page.\n',
+          '| (This window will automatically poll for successful sign-in every', interval, 'seconds)\n',
+          '========================================================================================'
+        );
         
-        currentUser = result.user;
-        await saveToken(currentUser.uid, token);
-        
-        // This is the next point of failure to check
-        await fetchUserName(currentUser); 
-        
-        return getUserInfo(result.user);
+        // 3. Start the polling loop
+        return new Promise((resolve, reject) => {
+            pollForToken(device_code, interval, resolve, reject, Date.now());
+        });
+
       } catch (error) {
-        console.error('!!! Auth Error: signInWithPopup failed.', error);
-        // Firebase Auth errors often have a 'code' and 'message' property
-        if ((error as any).code === 'auth/popup-closed-by-user') {
-          console.warn('User closed the login popup.');
-        }
+        console.error('!!! Auth Error: Failed to initiate GitHub Device Flow.', error);
         return;
       }
     },
     async signOut() {
-      if (!auth) {
-        await this.load();
-      }
-      await signOut(auth);
       deleteUserData(currentUser?.uid);
       currentUser = null;
+      isAuthenticated = false;
     },
     isLoggedIn() {
-      return currentUser != null;
+      return isAuthenticated;
     },
   };
+  
+  return authService;
 };
+
+// --- CORE UTILITY FUNCTIONS ---
 
 const saveToken = async (uid: string, token: string) => {
   localStorage.setItem('token_' + uid, await encrypt(token));
+  localStorage.setItem('current_uid', uid); // Track the current user
 };
 
 const getToken = async (uid?: string) => {
@@ -139,43 +236,36 @@ const getToken = async (uid?: string) => {
   return decrypt(token);
 };
 
-const saveUsername = (uid: string, username: string) => {
+const saveUsername = (uid: string, username: string, email: string, photoURL: string) => {
   localStorage.setItem('username_' + uid, username);
+  localStorage.setItem('email_' + uid, email);
+  localStorage.setItem('photoURL_' + uid, photoURL);
 };
 
 const deleteUserData = (uid?: string) => {
   if (!uid) return;
   localStorage.removeItem('token_' + uid);
   localStorage.removeItem('username_' + uid);
+  localStorage.removeItem('email_' + uid);
+  localStorage.removeItem('photoURL_' + uid);
+  localStorage.removeItem('current_uid');
 };
 
-const getUserInfo = async (user: FirebaseUser): Promise<User> => ({
+const getUserInfo = async (user: { uid: string }): Promise<User> => ({
   uid: user.uid,
-  displayName: user.displayName,
-  username: await fetchUserName(user),
-  email: user.email,
-  photoURL: user.photoURL,
+  displayName: localStorage.getItem('username_' + user.uid) || '',
+  username: localStorage.getItem('username_' + user.uid) || '',
+  email: localStorage.getItem('email_' + user.uid) || '',
+  photoURL: localStorage.getItem('photoURL_' + user.uid) || '',
   token: await getToken(user.uid),
 });
 
-const fetchUserName = async (user: FirebaseUser) => {
-  const uid = user.uid;
 
-  const fromLocalStorage = localStorage.getItem('username_' + uid);
-  if (fromLocalStorage) {
-    return fromLocalStorage;
-  }
-
-  const fromUserInfo = (user as any).reloadUserInfo?.screenName;
-  if (fromUserInfo) {
-    saveUsername(uid, fromUserInfo);
-    return fromUserInfo;
-  }
-
+const fetchUserName = async (uid: string) => {
   const token = await getToken(uid);
   if (!token) {
     console.warn('!!! Sync Warning: Cannot fetch username. Token is missing.');
-    return '';
+    return { username: '', displayName: '', email: '', photoURL: '' };
   }
 
   try {
@@ -183,33 +273,30 @@ const fetchUserName = async (user: FirebaseUser) => {
     const response = await fetch('https://api.github.com/user', {
       headers: {
         Accept: 'application/vnd.github.v3+json',
-        Authorization: 'token ' + token, // Use the token received from Firebase
+        Authorization: 'token ' + token,
       },
     });
 
     if (!response.ok) {
       console.error(`!!! Sync Error: GitHub API call failed with status ${response.status} (${response.statusText})`);
-      const errorText = await response.text();
-      console.error('!!! Sync Error: Response body:', errorText.substring(0, 200) + '...'); // Log part of the error body
-      // A 401 error here means the token is invalid or scopes are incorrect/expired.
       throw new Error(`GitHub user API failed: ${response.status}`);
     }
 
     const userInfo = await response.json();
-    const login = userInfo.login;
+    const login = userInfo.login || '';
+    const email = userInfo.email || '';
+    const photoURL = userInfo.avatar_url || '';
     
     if (!login) {
         console.error('!!! Sync Error: GitHub API response was successful but did not contain a "login" field.', userInfo);
-        return '';
     }
 
     console.log('--- Auth Debug: GitHub username fetched successfully:', login);
-    saveUsername(uid, login);
-    return login;
+    saveUsername(uid, login, email, photoURL);
+    return { username: login, displayName: userInfo.name || login, email, photoURL };
 
   } catch (error) {
     console.error('!!! Sync Error: Failed to fetch GitHub user info.', error);
-    // If the error is network related, this catch block will execute.
-    return '';
+    return { username: '', displayName: '', email: '', photoURL: '' };
   }
 };
