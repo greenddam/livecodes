@@ -2,15 +2,13 @@
 import type { GithubScope, User } from '../models';
 import { decrypt, encrypt } from '../storage';
 
-// --- CONFIGURATION CONSTANTS (MUST BE SET VIA ENVIRONMENT/BUILD PROCESS IN REAL APP) ---
-// Note: Client Secret is NOT required for the Device Flow exchange!
+// --- CONFIGURATION CONSTANTS ---
+// We have switched to using a Personal Access Token (PAT) for client-side authentication 
+// because all server-based OAuth flows (Authorization Code and Device Flow) are blocked 
+// by CORS/security policies in a pure browser environment without a secure backend.
 const GITHUB_CLIENT_ID = 'YOUR_GITHUB_CLIENT_ID';
-const DEVICE_CODE_URL = 'https://github.com/login/device/code';
-const ACCESS_TOKEN_URL = 'https://github.com/login/oauth/access_token';
-// IMPORTANT: This proxy is used to circumvent GitHub's CORS policy. 
-// We are switching to a new proxy URL to try and resolve the 404 error.
-// WARNING: This is for development/testing only. Use a secure backend for production.
-const CORS_PROXY = 'https://thingproxy.freeboard.io/fetch/'; 
+// Placeholder for the manually generated PAT
+const MANUAL_PAT_TOKEN = 'PASTE_YOUR_GITHUB_PERSONAL_ACCESS_TOKEN_HERE'; 
 // ---------------------------------------------------------------------------------------
 
 interface AuthService {
@@ -33,100 +31,6 @@ const fakeAuthService: AuthService = {
 let currentUser: User | null = null;
 let isAuthenticated = false;
 
-// Function to handle the polling loop (must be defined outside the service for cleaner recursion)
-const pollForToken = (
-  deviceCode: string, 
-  interval: number, 
-  resolve: (user: User | void) => void, 
-  reject: (error: Error) => void,
-  startTime: number
-) => {
-  const timeout = setTimeout(async () => {
-    // Check for expiration (GitHub usually expires in 10 minutes)
-    if (Date.now() - startTime > 600000) { // 10 minutes (600,000 ms)
-        clearTimeout(timeout);
-        console.error('!!! Auth Error: Device code expired (10 minute limit reached). Please try signing in again.');
-        reject(new Error('Device code expired.'));
-        return;
-    }
-
-    try {
-      // Use the new proxy for the token request
-      const proxiedAccessTokenUrl = CORS_PROXY + ACCESS_TOKEN_URL;
-
-      const response = await fetch(proxiedAccessTokenUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body: JSON.stringify({
-          client_id: GITHUB_CLIENT_ID,
-          device_code: deviceCode,
-          grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-        }),
-      });
-
-      const result = await response.json();
-
-      if (result.access_token) {
-        // SUCCESS! Authorization granted.
-        clearTimeout(timeout);
-        const token = result.access_token;
-        console.log('--- Auth Debug: Access token received successfully!');
-        
-        const tempUid = 'github-' + Math.random().toString(36).substring(2, 10); 
-        await saveToken(tempUid, token);
-
-        const userInfo = await fetchUserName(tempUid); 
-        
-        const user: User = {
-          uid: tempUid,
-          displayName: userInfo.displayName,
-          username: userInfo.username,
-          email: userInfo.email,
-          photoURL: userInfo.photoURL,
-          token: token,
-        };
-
-        currentUser = user;
-        isAuthenticated = true;
-        resolve(user);
-
-      } else if (result.error === 'authorization_pending') {
-        // User hasn't finished yet. Continue polling.
-        console.log('--- Auth Debug: Waiting for user authorization...');
-        pollForToken(deviceCode, interval, resolve, reject, startTime);
-
-      } else if (result.error === 'slow_down') {
-        // GitHub asked us to poll slower. Adjust interval.
-        const newInterval = interval + 5000; // Increase by 5 seconds
-        console.warn('--- Auth Warning: Slowing down polling interval to', newInterval, 'ms');
-        pollForToken(deviceCode, newInterval, resolve, reject, startTime);
-
-      } else if (result.error === 'access_denied') {
-        // User declined the authorization.
-        clearTimeout(timeout);
-        console.error('!!! Auth Error: Access denied by user.');
-        reject(new Error('Access denied by user.'));
-
-      } else if (result.error === 'expired_token') {
-        // Authorization window passed.
-        clearTimeout(timeout);
-        console.error('!!! Auth Error: Device code expired (10 minute limit reached). Please try signing in again.');
-        reject(new Error('Device code expired.'));
-
-      } else {
-        // Any other error.
-        clearTimeout(timeout);
-        console.error('!!! Auth Error: Unknown polling error:', result.error_description || result.error);
-        reject(new Error(result.error_description || 'Unknown authentication error.'));
-      }
-    } catch (error) {
-      clearTimeout(timeout);
-      console.error('!!! Auth Error: Network failure during token polling.', error);
-      reject(error as Error);
-    }
-  }, interval * 1000); // interval is in seconds
-};
-
 
 export const createAuthService = (isEmbed: boolean): AuthService => {
   if (isEmbed) return fakeAuthService;
@@ -141,7 +45,7 @@ export const createAuthService = (isEmbed: boolean): AuthService => {
           // Re-fetch user info using existing token to ensure cached data is fresh
           await fetchUserName(existingUid); 
           
-          // Use the utility function to construct the user object, resolving the TS error
+          // Use the utility function to construct the user object
           currentUser = await getUserInfo({ uid: existingUid });
           isAuthenticated = true;
         }
@@ -154,68 +58,48 @@ export const createAuthService = (isEmbed: boolean): AuthService => {
       return undefined;
     },
     async signIn(scopes: GithubScope[] = ['gist', 'repo']): Promise<User | void> {
-      try {
-        console.log('--- Auth Debug: Requesting Device Code from GitHub...');
-        
-        // 1. Request the device and user codes
-        const scopeString = scopes.join(' ');
-        
-        // Use the new proxy for the initial device code request
-        const proxiedDeviceCodeUrl = CORS_PROXY + DEVICE_CODE_URL;
-
-        const response = await fetch(proxiedDeviceCodeUrl, {
-          method: 'POST',
-          headers: { 
-            'Content-Type': 'application/json',
-            'Accept': 'application/json' // Request JSON response
-          },
-          body: JSON.stringify({
-            client_id: GITHUB_CLIENT_ID,
-            scope: scopeString
-          })
-        });
-
-        if (!response.ok) {
-           // If the proxy returns a 404, we catch it here.
-           let errorMessage = `Device code request failed: ${response.status} - ${response.statusText}`;
-           try {
-               const errorBody = await response.json();
-               errorMessage += ` (${errorBody.error || errorBody.message || 'No details'})`;
-           } catch {}
-           throw new Error(errorMessage);
-        }
-
-        const result = await response.json();
-
-        const { 
-          device_code, 
-          user_code, 
-          verification_uri, 
-          interval 
-        } = result;
-
-        if (!device_code || !user_code || !verification_uri) {
-            throw new Error('Missing required codes from GitHub response.');
-        }
-
-        // 2. Instruct the user (using console since we can't show a custom modal)
-        console.log(
+      console.warn('--- Auth Warning: GitHub OAuth flows failed due to network security constraints (CORS/Certificates).');
+      
+      const pat = MANUAL_PAT_TOKEN.trim();
+      
+      if (pat === 'PASTE_YOUR_GITHUB_PERSONAL_ACCESS_TOKEN_HERE' || pat === '') {
+        console.error(
           '========================================================================================\n',
-          '| 🐙 GITHUB SIGN IN REQUIRED |\n',
-          '| 1. Open this URL in a new tab: ', verification_uri, '\n',
-          '| 2. Enter the following code when prompted: ', user_code, '\n',
-          '| 3. Click "Authorize" on the GitHub page.\n',
-          '| (This window will automatically poll for successful sign-in every', interval, 'seconds)\n',
+          '| 🛑 AUTHENTICATION REQUIRED |\n',
+          '| To proceed without a backend server, you must use a Personal Access Token (PAT). |\n',
+          '| 1. Go to your GitHub settings -> Developer settings -> Personal access tokens. |\n',
+          '| 2. Generate a new token with the required scopes (', scopes.join(', '), '). |\n',
+          '| 3. Replace the value of the MANUAL_PAT_TOKEN constant in the code with your new token. |\n',
+          '| 4. Try signing in again.\n',
           '========================================================================================'
         );
-        
-        // 3. Start the polling loop
-        return new Promise((resolve, reject) => {
-            pollForToken(device_code, interval, resolve, reject, Date.now());
-        });
+        return; 
+      }
 
+      try {
+        const tempUid = 'pat-user-' + Math.random().toString(36).substring(2, 10); 
+        await saveToken(tempUid, pat);
+
+        const userInfo = await fetchUserName(tempUid); 
+        
+        const user: User = {
+          uid: tempUid,
+          displayName: userInfo.displayName,
+          username: userInfo.username,
+          email: userInfo.email,
+          photoURL: userInfo.photoURL,
+          token: pat,
+        };
+
+        currentUser = user;
+        isAuthenticated = true;
+        console.log('--- Auth Debug: Successfully signed in using Personal Access Token (PAT).');
+        return user;
+        
       } catch (error) {
-        console.error('!!! Auth Error: Failed to initiate GitHub Device Flow.', error);
+        console.error('!!! Auth Error: PAT failed or user info fetch failed. Check if token is valid and has correct scopes.', error);
+        // Clean up the invalid token attempt
+        deleteUserData('pat-user-' + tempUid);
         return;
       }
     },
@@ -280,7 +164,7 @@ const fetchUserName = async (uid: string) => {
 
   try {
     console.log('--- Auth Debug: Attempting to fetch GitHub username with token...');
-    // We do NOT proxy this call since the GitHub /user API is CORS-enabled.
+    // This call is CORS-enabled, so no proxy is needed.
     const response = await fetch('https://api.github.com/user', {
       headers: {
         Accept: 'application/vnd.github.v3+json',
