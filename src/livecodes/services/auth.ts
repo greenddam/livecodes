@@ -7,6 +7,10 @@ import { decrypt, encrypt } from '../storage';
 const GITHUB_CLIENT_ID = 'YOUR_GITHUB_CLIENT_ID';
 const DEVICE_CODE_URL = 'https://github.com/login/device/code';
 const ACCESS_TOKEN_URL = 'https://github.com/login/oauth/access_token';
+// IMPORTANT: This proxy is used to circumvent GitHub's CORS policy. 
+// We are switching to a new proxy URL to try and resolve the 404 error.
+// WARNING: This is for development/testing only. Use a secure backend for production.
+const CORS_PROXY = 'https://thingproxy.freeboard.io/fetch/'; 
 // ---------------------------------------------------------------------------------------
 
 interface AuthService {
@@ -47,7 +51,10 @@ const pollForToken = (
     }
 
     try {
-      const response = await fetch(ACCESS_TOKEN_URL, {
+      // Use the new proxy for the token request
+      const proxiedAccessTokenUrl = CORS_PROXY + ACCESS_TOKEN_URL;
+
+      const response = await fetch(proxiedAccessTokenUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
         body: JSON.stringify({
@@ -152,7 +159,11 @@ export const createAuthService = (isEmbed: boolean): AuthService => {
         
         // 1. Request the device and user codes
         const scopeString = scopes.join(' ');
-        const response = await fetch(DEVICE_CODE_URL, {
+        
+        // Use the new proxy for the initial device code request
+        const proxiedDeviceCodeUrl = CORS_PROXY + DEVICE_CODE_URL;
+
+        const response = await fetch(proxiedDeviceCodeUrl, {
           method: 'POST',
           headers: { 
             'Content-Type': 'application/json',
@@ -165,8 +176,13 @@ export const createAuthService = (isEmbed: boolean): AuthService => {
         });
 
         if (!response.ok) {
-           const errorBody = await response.json();
-           throw new Error(`Device code request failed: ${response.status} - ${errorBody.error}`);
+           // If the proxy returns a 404, we catch it here.
+           let errorMessage = `Device code request failed: ${response.status} - ${response.statusText}`;
+           try {
+               const errorBody = await response.json();
+               errorMessage += ` (${errorBody.error || errorBody.message || 'No details'})`;
+           } catch {}
+           throw new Error(errorMessage);
         }
 
         const result = await response.json();
@@ -264,6 +280,7 @@ const fetchUserName = async (uid: string) => {
 
   try {
     console.log('--- Auth Debug: Attempting to fetch GitHub username with token...');
+    // We do NOT proxy this call since the GitHub /user API is CORS-enabled.
     const response = await fetch('https://api.github.com/user', {
       headers: {
         Accept: 'application/vnd.github.v3+json',
