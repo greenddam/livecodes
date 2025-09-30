@@ -8,7 +8,83 @@ import { isInIframe } from './utils/utils';
 import { codeMirrorBaseUrl, esModuleShimsPath } from './vendors';
 
 export type { API, Config };
+/**
+ * Creates and shows a responsive, custom modal dialog to securely prompt
+ * the user for a GitHub Personal Access Token (PAT).
+ *
+ * This function builds a temporary, self-contained modal element in the DOM
+ * using standard HTML/CSS (Tailwind classes) and resolves a Promise based on
+ * user action. It is called by the authentication service.
+ *
+ * @param message The prompt message (e.g., listing required scopes).
+ * @returns A promise that resolves with the entered PAT string, or null if canceled.
+ */
+const createPatInputModal = (message: string): Promise<string | null> => {
+  // We use standard DOM manipulation and Tailwind classes for a clean, responsive UI.
+  const modalHTML = `
+    <!-- Modal Backdrop: Fixed overlay with dim background -->
+    <div id="pat-modal-backdrop" class="fixed inset-0 bg-gray-900 bg-opacity-70 z-[100] flex items-center justify-center transition-opacity duration-300 opacity-0">
+      <!-- Modal Content Box -->
+      <div class="bg-white max-w-lg w-11/12 p-6 rounded-xl shadow-2xl transform scale-95 transition-transform duration-300">
+        <h2 class="text-xl font-bold text-gray-800 mb-3 text-purple-600">
+          GitHub Personal Access Token
+        </h2>
+        <p class="text-sm text-gray-600 mb-4">${message}</p>
+        
+        <label for="pat-input" class="block text-sm font-medium text-gray-700 mb-1">
+          Token:
+        </label>
+        <input 
+          type="password" 
+          id="pat-input" 
+          class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-purple-500 focus:border-purple-500 text-sm"
+          placeholder="ghp_xxxxxxxxxxxxxxxxxxxxxx"
+          autocomplete="off"
+        >
 
+        <div class="mt-6 flex justify-end space-x-3">
+          <button id="pat-cancel" class="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-200 rounded-xl hover:bg-gray-300 transition">Cancel</button>
+          <button id="pat-ok" class="px-4 py-2 text-sm font-medium text-white bg-purple-600 rounded-xl shadow-md hover:bg-purple-700 transition">Sign In</button>
+        </div>
+      </div>
+    </div>
+  `;
+
+  const wrapper = document.createElement('div');
+  wrapper.innerHTML = modalHTML;
+  // Cast to HTMLElement to expose DOM properties like classList, querySelector, and remove()
+  const modalEl = wrapper.firstChild as HTMLElement; 
+
+  return new Promise((resolve) => {
+    document.body.appendChild(modalEl);
+    
+    // Add a slight delay to ensure the element is in the DOM before applying fade-in effects
+    setTimeout(() => {
+      modalEl.classList.remove('opacity-0');
+      (modalEl.querySelector('.shadow-2xl') as HTMLElement)?.classList.remove('scale-95');
+    }, 10);
+
+    const handleClose = (pat: string | null) => {
+      // Start fade-out and shrink transition
+      modalEl.classList.add('opacity-0');
+      (modalEl.querySelector('.shadow-2xl') as HTMLElement)?.classList.add('scale-95');
+      // Remove the element completely after the transition finishes (300ms)
+      setTimeout(() => modalEl.remove(), 300);
+      resolve(pat);
+    };
+
+    const okButton = modalEl.querySelector('#pat-ok');
+    const cancelButton = modalEl.querySelector('#pat-cancel');
+    const patInput = modalEl.querySelector('#pat-input') as HTMLInputElement | null;
+
+    // Attach event listeners
+    okButton?.addEventListener('click', () => handleClose(patInput?.value.trim() ?? null));
+    cancelButton?.addEventListener('click', () => handleClose(null));
+  });
+};
+
+// Expose the implementation globally for the authentication service (called from auth_service.ts)
+(window as any).showPatInputModal = createPatInputModal;
 export const params = new URLSearchParams(location.search);
 const isHeadless =
   (params.get('headless') != null && params.get('headless') !== 'false') ||
