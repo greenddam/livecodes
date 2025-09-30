@@ -103,7 +103,7 @@ const pollForToken = (
       } else if (result.error === 'expired_token') {
         // Authorization window passed.
         clearTimeout(timeout);
-        console.error('!!! Auth Error: Device code expired. Please try signing in again.');
+        console.error('!!! Auth Error: Device code expired (10 minute limit reached). Please try signing in again.');
         reject(new Error('Device code expired.'));
 
       } else {
@@ -131,17 +131,11 @@ export const createAuthService = (isEmbed: boolean): AuthService => {
       if (existingUid) {
         const token = await getToken(existingUid);
         if (token) {
-          // Re-fetch user info using existing token
-          const userInfo = await fetchUserName(existingUid); 
+          // Re-fetch user info using existing token to ensure cached data is fresh
+          await fetchUserName(existingUid); 
           
-          currentUser = {
-            uid: existingUid,
-            displayName: userInfo.displayName,
-            username: userInfo.username,
-            email: userInfo.email,
-            photoURL: userInfo.photoURL,
-            token: token,
-          } as User;
+          // Use the utility function to construct the user object, resolving the TS error
+          currentUser = await getUserInfo({ uid: existingUid });
           isAuthenticated = true;
         }
       }
