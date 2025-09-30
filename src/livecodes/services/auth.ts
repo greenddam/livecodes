@@ -6,8 +6,8 @@ import { decrypt, encrypt } from '../storage';
 // We have switched to using a Personal Access Token (PAT) for client-side authentication 
 // because all server-based OAuth flows (Authorization Code and Device Flow) are blocked 
 // by CORS/security policies in a pure browser environment without a secure backend.
-// Removed GITHUB_CLIENT_ID as it is no longer used for PAT authentication.
-// Placeholder for the manually generated PAT
+// Placeholder for the manually generated PAT. This is now used as a fallback if the 
+// UI does not prompt the user for input.
 const MANUAL_PAT_TOKEN = 'PASTE_YOUR_GITHUB_PERSONAL_ACCESS_TOKEN_HERE'; 
 // ---------------------------------------------------------------------------------------
 
@@ -30,6 +30,11 @@ const fakeAuthService: AuthService = {
 // Internal state to hold user data
 let currentUser: User | null = null;
 let isAuthenticated = false;
+
+// NOTE: We declare a global function here. In a real application, the main UI 
+// would implement a custom modal/popup (since alert/prompt are blocked) and expose
+// a function named `showPatInputModal` to the window object for this service to call.
+declare function showPatInputModal(message: string): Promise<string | null>;
 
 
 export const createAuthService = (isEmbed: boolean): AuthService => {
@@ -60,21 +65,37 @@ export const createAuthService = (isEmbed: boolean): AuthService => {
     async signIn(scopes: GithubScope[] = ['gist', 'repo']): Promise<User | void> {
       console.warn('--- Auth Warning: GitHub OAuth flows failed due to network security constraints (CORS/Certificates).');
       
-      const pat = MANUAL_PAT_TOKEN.trim();
+      let pat = MANUAL_PAT_TOKEN.trim();
       
+      // 1. Check if the hardcoded placeholder is present.
       if (pat === 'PASTE_YOUR_GITHUB_PERSONAL_ACCESS_TOKEN_HERE' || pat === '') {
+        
+        // 2. Attempt to use the simulated modal/popup function.
+        if (typeof (window as any).showPatInputModal === 'function') {
+             try {
+                // Call the host's function to show the PAT input popup.
+                pat = await (window as any).showPatInputModal(
+                  `Please enter your GitHub Personal Access Token (PAT) with scopes: ${scopes.join(', ')}`
+                ) || '';
+             } catch (e) {
+                console.error('!!! Auth Error: PAT input modal was dismissed or failed.');
+                return;
+             }
+        }
+      }
+      
+      // 3. Final check: if PAT is still missing, log error and exit.
+      if (!pat || pat === 'PASTE_YOUR_TOKEN_HERE') {
         console.error(
           '========================================================================================\n',
           '| 🛑 AUTHENTICATION REQUIRED |\n',
-          '| To proceed without a backend server, you must use a Personal Access Token (PAT). |\n',
-          '| 1. Go to your GitHub settings -> Developer settings -> Personal access tokens. |\n',
-          '| 2. Generate a new token with the required scopes (', scopes.join(', '), '). |\n',
-          '| 3. Replace the value of the MANUAL_PAT_TOKEN constant in the code with your new token. |\n',
-          '| 4. Try signing in again.\n',
+          '| To proceed without a backend server, you must provide a Personal Access Token (PAT). |\n',
+          '| Set the MANUAL_PAT_TOKEN constant or ensure the host UI provides a PAT input modal. |\n',
           '========================================================================================'
         );
-        return; 
+        return;
       }
+
 
       // Declare tempUid outside the try block so it is accessible in the catch block
       let tempUid = '';
