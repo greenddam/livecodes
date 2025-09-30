@@ -6,7 +6,7 @@ import { decrypt, encrypt } from '../storage';
 // We have switched to using a Personal Access Token (PAT) for client-side authentication 
 // because all server-based OAuth flows (Authorization Code and Device Flow) are blocked 
 // by CORS/security policies in a pure browser environment without a secure backend.
-const GITHUB_CLIENT_ID = 'YOUR_GITHUB_CLIENT_ID';
+// Removed GITHUB_CLIENT_ID as it is no longer used for PAT authentication.
 // Placeholder for the manually generated PAT
 const MANUAL_PAT_TOKEN = 'PASTE_YOUR_GITHUB_PERSONAL_ACCESS_TOKEN_HERE'; 
 // ---------------------------------------------------------------------------------------
@@ -76,8 +76,10 @@ export const createAuthService = (isEmbed: boolean): AuthService => {
         return; 
       }
 
+      // Declare tempUid outside the try block so it is accessible in the catch block
+      let tempUid = '';
       try {
-        const tempUid = 'pat-user-' + Math.random().toString(36).substring(2, 10); 
+        tempUid = 'pat-user-' + Math.random().toString(36).substring(2, 10); 
         await saveToken(tempUid, pat);
 
         const userInfo = await fetchUserName(tempUid); 
@@ -98,8 +100,8 @@ export const createAuthService = (isEmbed: boolean): AuthService => {
         
       } catch (error) {
         console.error('!!! Auth Error: PAT failed or user info fetch failed. Check if token is valid and has correct scopes.', error);
-        // Clean up the invalid token attempt
-        deleteUserData('pat-user-' + tempUid);
+        // Clean up the invalid token attempt using the now-scoped tempUid
+        deleteUserData(tempUid); 
         return;
       }
     },
